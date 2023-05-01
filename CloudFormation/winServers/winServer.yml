@@ -1,0 +1,215 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Project 2 Infrastructure as code 
+
+Parameters:
+  EnvironmentName:
+    Description: An environment name that will be prefixed to resource names
+    Type: String 
+    
+  AMItoUse:
+    Description: AMI to use for our base Image
+    Type: String
+    
+  InstanceTypetoUse:
+    Description: Instance type for our ec2 server
+    Type: String
+
+Resources:
+  
+  S3AccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - ec2.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Policies:
+      - PolicyName: EC2S3Access
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - s3:GetObject
+            Resource:
+            - arn:aws:s3:::my-661638280599-bucket
+            - arn:aws:s3:::my-661638280599-bucket/*
+    
+  S3AccessInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: 
+      Roles:
+        - !Ref S3AccessRole
+
+  # Load balancer security Group
+  LBSecGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow http to our load balancer
+      VpcId:
+        Fn::ImportValue:
+          !Sub "${EnvironmentName}-VPCID"
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  # Lauch configuration Security Group
+  WebSerSecGroup:
+    Type: AWS::EC2::SecurityGroup 
+    Properties:
+      GroupDescription: Allow http to our hosts and SSH from local only
+      VpcId:
+        Fn::ImportValue:
+          !Sub "${EnvironmentName}-VPCID"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 0.0.0.0/0
+  
+  WebAppLaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      UserData:
+        Fn::Base64: !Sub |
+          <powershell>
+          # Install Apache 2
+          Install-WindowsFeature Web-Server -IncludeAllSubFeature
+          # Configure Apache 2 to listen on port 80
+          Set-Content -Path "C:\inetpub\wwwroot\index.html" -Value "<VirtualHost *:80>\n</VirtualHost>"
+          # Create index.html file
+          New-Item -ItemType File -Path "C:\inetpub\wwwroot\index.html" -Force
+          Set-Content -Path "C:\inetpub\wwwroot\index.html" -Value "<h1>It works! Udagram, Udacity</h1>"
+          # Start Apache 2 service
+          Start-Service W3SVC
+          </powershell>     
+      ImageId:  !Ref AMItoUse
+      IamInstanceProfile: !Ref S3AccessInstanceProfile 
+      SecurityGroups:
+      - !Ref WebSerSecGroup
+      InstanceType: !Ref InstanceTypetoUse
+      BlockDeviceMappings:
+        - DeviceName: '/dev/sda1'
+          Ebs:
+            VolumeSize: 30
+            VolumeType: gp2
+
+  WebAppGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+      - Fn::ImportValue: 
+          !Sub "${EnvironmentName}-PRIV-NETS"
+      LaunchConfigurationName:
+        !Ref WebAppLaunchConfig
+      MinSize: '2'
+      MaxSize: '4'
+      TargetGroupARNs:
+      - !Ref WebAppTargetGroup
+
+  WebAppLB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Subnets:
+      - Fn::ImportValue: !Sub "${EnvironmentName}-PUB1-SN"
+      - Fn::ImportValue: !Sub "${EnvironmentName}-PUB2-SN"
+      SecurityGroups:
+      - !Ref LBSecGroup
+      
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+      - Type: forward
+        TargetGroupArn:
+          !Ref WebAppTargetGroup
+      LoadBalancerArn:
+        !Ref WebAppLB
+      Port: 80
+      Protocol: HTTP
+      
+  ALBListenerRule:
+      Type: AWS::ElasticLoadBalancingV2::ListenerRule
+      Properties:
+        Actions:
+        - Type: forward
+          TargetGroupArn: !Ref 'WebAppTargetGroup'
+        Conditions:
+        - Field: path-pattern
+          Values: [/]
+        ListenerArn: !Ref 'Listener'
+        Priority: 1
+        
+  WebAppTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 10
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 8
+      HealthyThresholdCount: 2
+      Port: 80
+      Protocol: HTTP
+      UnhealthyThresholdCount: 5
+      VpcId: 
+        Fn::ImportValue:
+          Fn::Sub: "${EnvironmentName}-VPCID"
+
+  # Adding SNS Topic and Subscription and CloudWatch Alarms  
+  SNSAlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: AlarmNotifications
+      TopicName: AlarmNotifications
+
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: your_email2@example.com
+      Protocol: email
+      TopicArn: !Ref SNSAlarmTopic
+    DeletionPolicy: Delete
+      
+  HighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: HighCPUAlarm
+      AlarmDescription: "Alarm if CPU utilization exceeds 70% for 5 minutes"
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: 5
+      MetricName: CPUUtilization
+      Namespace: AWS/EC2
+      Period: 300
+      Statistic: Average
+      Threshold: 70
+      ActionsEnabled: true
+      AlarmActions:
+        - !Ref SNSAlarmTopic
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref WebAppGroup
+      Unit: Percent
+
+Outputs:
+  LoadBalancerURL: 
+        Description: URL of the Load Balancer
+        Value: !Join ['', ['http://', !GetAtt WebAppLB.DNSName]]
+        Export:
+          Name: !Sub ${EnvironmentName}-LB-URL
